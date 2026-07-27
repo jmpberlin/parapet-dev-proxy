@@ -1,0 +1,36 @@
+name: Deploy egress proxy allowlist
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render config
+        run: envsubst < squid.conf.template > squid.conf
+        env:
+          APP_BOX_PRIVATE_IP: ${{ vars.APP_BOX_PUBLIC_IP }}
+
+      - name: Validate syntax before touching the box
+        run: docker run --rm -v $PWD/squid.conf:/etc/squid/squid.conf ubuntu/squid squid -k parse
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Deploy and reload
+        run: |
+          cat squid.conf | ssh -o StrictHostKeyChecking=accept-new root@${{ vars.PROXY_HOST }} \
+            'cp /etc/squid/squid.conf /etc/squid/squid.conf.bak && cat > /etc/squid/squid.conf && squid -k parse && systemctl reload squid'
+
+      - name: Smoke test
+        run: |
+          ssh root@${{ vars.PROXY_HOST }} \
+            'curl -x localhost:3128 --fail -s -o /dev/null https://api.github.com && \
+             ! curl -x localhost:3128 -s -o /dev/null https://example.com'
