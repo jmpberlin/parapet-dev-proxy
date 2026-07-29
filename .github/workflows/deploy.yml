@@ -12,7 +12,7 @@ jobs:
       - name: Render config
         run: envsubst < squid.conf.template > squid.conf
         env:
-          APP_BOX_PUBLIC_IP: ${{ vars.APP_BOX_PUBLIC_IP }}
+          DEV_SERVER_PUBLIC_IP: ${{ vars.DEV_SERVER_PUBLIC_IP }}
 
       - name: Validate syntax before touching the box
         run: docker run --rm -v $PWD/squid.conf:/etc/squid/squid.conf ubuntu/squid squid -k parse
@@ -32,5 +32,5 @@ jobs:
       - name: Smoke test from the actual dev server
         run: |
           ssh -o StrictHostKeyChecking=accept-new root@${{ vars.DEV_SERVER_TAILNET_HOST }} \
-            "curl -x http://${{ vars.PROXY_PUBLIC_IP }}:3128 --fail -s -o /dev/null https://api.github.com && \
-            ! curl -x http://${{ vars.PROXY_PUBLIC_IP }}:3128 -s -o /dev/null https://example.com"
+            "curl -x http://${{ vars.DEV_PROXY_PUBLIC_IP }}:3128 --fail -s -o /dev/null https://api.github.com && \
+            ! curl -x http://${{ vars.DEV_PROXY_PUBLIC_IP }}:3128 -s -o /dev/null https://example.com"
