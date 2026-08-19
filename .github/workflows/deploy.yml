@@ -12,7 +12,8 @@ jobs:
       - name: Render config
         run: envsubst < squid.conf.template > squid.conf
         env:
-          DEV_SERVER_PUBLIC_IP: ${{ vars.DEV_SERVER_PUBLIC_IP }}
+          GATEWAY_PRIVATE_IP: ${{ vars.GATEWAY_PRIVATE_IP }}
+          DEV_SERVER_PRIVATE_IP: ${{ vars.DEV_SERVER_PRIVATE_IP }}
 
       - name: Validate syntax before touching the box
         run: docker run --rm -v $PWD/squid.conf:/etc/squid/squid.conf ubuntu/squid squid -k parse
@@ -26,7 +27,7 @@ jobs:
 
       - name: Deploy and reload
         run: |
-          cat squid.conf | ssh -o StrictHostKeyChecking=accept-new root@${{ vars.DEV_PROXY_TAILNET_HOST }} \
+          cat squid.conf | ssh -o StrictHostKeyChecking=accept-new root@${{ vars.GATEWAY_TAILNET_HOST }} \
             'cp /etc/squid/squid.conf /etc/squid/squid.conf.bak && cat > /etc/squid/squid.conf && squid -k parse && systemctl reload squid'
 
       - name: Smoke test from the actual dev server
