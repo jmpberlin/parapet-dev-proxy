@@ -9,7 +9,8 @@ acl allowed_dst dstdomain \
     api.anthropic.com \
     bleepingcomputer.com \
     socket.dev \
-    .docker.io
+    .docker.io \
+    .docker.com
 
 acl SSL_ports port 443
 acl CONNECT method CONNECT
