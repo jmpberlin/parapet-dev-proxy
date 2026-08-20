@@ -3,7 +3,6 @@ http_port ${GATEWAY_PRIVATE_IP}:3128
 acl allowed_src src ${DEV_SERVER_PRIVATE_IP}/32
 
 acl allowed_dst dstdomain \
-    api.github.com \
     .github.com \
     .githubusercontent.com \
     ghcr.io \
