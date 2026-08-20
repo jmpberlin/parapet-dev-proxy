@@ -4,6 +4,7 @@ acl allowed_src src ${DEV_SERVER_PRIVATE_IP}/32
 
 acl allowed_dst dstdomain \
     api.github.com \
+    .github.com \
     .githubusercontent.com \
     ghcr.io \
     api.anthropic.com \
