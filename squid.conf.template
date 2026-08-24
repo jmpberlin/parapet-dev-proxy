@@ -7,7 +7,7 @@ acl allowed_dst dstdomain \
     .githubusercontent.com \
     ghcr.io \
     api.anthropic.com \
-    bleepingcomputer.com \
+    .bleepingcomputer.com \
     socket.dev \
     .docker.io \
     .docker.com
