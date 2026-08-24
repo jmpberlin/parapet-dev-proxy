@@ -30,8 +30,9 @@ jobs:
           cat squid.conf | ssh -o StrictHostKeyChecking=accept-new root@${{ vars.GATEWAY_TAILNET_HOST }} \
             'cp /etc/squid/squid.conf /etc/squid/squid.conf.bak && cat > /etc/squid/squid.conf && squid -k parse && systemctl reload squid'
 
-      - name: Smoke test from the actual dev server
+      - name: Smoke test
         run: |
-          ssh -o StrictHostKeyChecking=accept-new root@${{ vars.DEV_SERVER_TAILNET_HOST }} \
-            "curl -x http://${{ vars.DEV_PROXY_PUBLIC_IP }}:3128 --fail -s -o /dev/null https://api.github.com && \
-            ! curl -x http://${{ vars.DEV_PROXY_PUBLIC_IP }}:3128 -s -o /dev/null https://example.com"
+          ssh -o StrictHostKeyChecking=accept-new root@${{ vars.GATEWAY_TAILNET_HOST }} \
+            "ssh -o StrictHostKeyChecking=accept-new -i /root/.ssh/dev_deploy root@${{ vars.DEV_SERVER_PRIVATE_IP }} \
+              'curl -x http://${{ vars.GATEWAY_PRIVATE_IP }}:3128 --fail -s -o /dev/null https://api.github.com && \
+              ! curl -x http://${{ vars.GATEWAY_PRIVATE_IP }}:3128 -s -o /dev/null https://example.com'" 
