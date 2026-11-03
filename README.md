@@ -1,189 +1,161 @@
 # parapet-dev-proxy
-
-A forward proxy that restricts what the `parapet` dev server (`parapet-hetzner-dev`) is allowed to talk to on the internet — enforced as a domain allowlist, running on its own, separate box.
-
-This repo holds the Squid configuration and the GitHub Action that deploys it. It exists so that changing the allowlist is a normal, reviewable git change, not a manual edit on a live server.
-
+ 
+The Squid configuration and the GitHub Action that deploys it, for the **gateway** that restricts what the `parapet` dev box may talk to on the internet. Egress is enforced as a domain allowlist on a separate trusted machine.
+ 
+This repo exists so that changing the allowlist is a normal, reviewable git change, not a manual edit on a live server.
+ 
+> **Full architecture and from-scratch setup:** see `DEPLOY_DEV.md` in the `parapet` repo (Phases 0–15). This README covers only what lives in *this* repo: the allowlist and its deploy pipeline.
+ 
 ---
-
+ 
+## Architecture in one picture
+ 
+```
+                         Tailscale tailnet
+   laptop / CI (tag:ci) ───────────────┐
+                                       ▼
+                        ┌──────────────────────────┐
+                        │ Gateway (trusted)        │  public IP
+                        │ 10.0.0.2                 │  tag:gateway
+                        │  • Tailscale subnet rtr  │
+                        │  • Squid :3128 (private) │
+                        │  • nftables (one-way+NAT)│
+                        └────────────┬─────────────┘
+              Hetzner private network│ 10.0.0.0/16
+                        ┌────────────▼─────────────┐
+                        │ Dev box (untrusted)      │  NO public IP
+                        │ 10.0.0.4                 │  NO Tailscale
+                        └──────────────────────────┘
+```
+ 
+- **Inbound** (CI/laptop → dev box): tailnet → gateway's advertised route `10.0.0.4/32` → dev box. The gateway masquerades this traffic.
+- **Outbound** (dev box → internet): only via `HTTP_PROXY`/`HTTPS_PROXY` to Squid on the gateway (`10.0.0.2:3128`), which allows listed domains only.
+- **Dev box → tailnet:** dropped by nftables on the gateway. The dev box cannot initiate connections into the tailnet.
 ## Why this exists
-
-The dev box runs code written by an AI pipeline (`ai-dev-orchestration`), often without a human having read every line before it runs. If that code — accidentally or maliciously — tried to send data somewhere it shouldn't, the only thing standing in the way is network egress control. The goal: the dev box can reach a short, explicit list of domains it actually needs (GitHub, GHCR, Anthropic's API, a couple of content sources) and **nothing else**.
-
-### Why not just use the Hetzner Cloud Firewall for this
-
-Hetzner's Cloud Firewall filters by **IP address / CIDR range only** — it has no concept of a domain name. Every domain on our allowlist (`api.github.com`, `ghcr.io`, Docker Hub, etc.) is served from CDN infrastructure with IP ranges that are large, shared with countless other tenants, and change over time. GitHub's own documentation explicitly advises against allowlisting by IP for this reason. So a domain-based allowlist has to be enforced by something that actually understands domains — that's what Squid does, via its `CONNECT` handling (it reads the hostname in the `CONNECT api.github.com:443` line and decides there, without ever decrypting the TLS session itself).
-
-### Why a *second, separate* box, rather than a proxy container next to the app
-
-If the proxy ran on the same machine as the app (even in a separate container), a sufficiently compromised app container or a host-level compromise could disable or bypass it — root on a box can always flush its own iptables rules or kill a sibling container. Putting the proxy on an **entirely separate machine** means the dev box would have to compromise a *different* machine — one it holds no credentials to — to defeat the restriction. That asymmetry (the app box can send traffic to the proxy, but cannot reconfigure it) is the actual security property here, not just tidiness.
-
-### The two independent layers
-
-1. **Hetzner Cloud Firewall** (enforced outside the guest OS, on both boxes):
-   - `parapet-hetzner-dev` may only egress to this proxy's IP on `tcp:3128`, plus what Tailscale itself needs (see below).
-   - This proxy box only accepts inbound from the dev box's IP on `tcp:3128`.
-2. **Squid's own ACL** (`squid.conf` in this repo): even if something reached this box on 3128, Squid only relays to the domains explicitly listed — everything else gets denied at the application layer.
-
-Two layers, two different machines enforcing them, so defeating one doesn't defeat the other.
-
+ 
+The dev box runs code written by an AI pipeline (`ai-dev-orchestration`), often before a human has read every line. If that code tried to send data somewhere it shouldn't, network egress control is what stands in the way. The dev box may reach a short, explicit list of domains (GitHub, GHCR, Docker, Anthropic's API, a couple of content sources) and nothing else.
+ 
+**Non-goal:** preventing exfiltration entirely. An allowlisted domain such as GitHub or an LLM API is also a possible exfiltration channel. This design reduces blast radius; it does not eliminate it.
+ 
+### Why not the Hetzner Cloud Firewall
+ 
+- It filters by IP/CIDR only. Our domains sit behind CDNs with large, shifting IP ranges, so a domain allowlist needs something that reads the hostname (Squid, via the `CONNECT host:443` line, without decrypting TLS).
+- It does **not** filter Hetzner private-network traffic, so it cannot be the control for the dev-box → gateway path.
+### Why a separate box
+ 
+Root on the app box can flush its own firewall rules or kill a sibling container. The proxy therefore runs on a different machine the dev box holds no credentials for. The dev box can *use* the proxy but cannot *reconfigure* it; that asymmetry is the security property.
+ 
 ---
-
-## One-time manual setup
-
-These steps can't be automated by the pipeline — provisioning cloud infrastructure and the very first Squid install have to happen before there's anything for a GitHub Action to deploy *to*.
-
-### 1. Provision the box
-
-A small Hetzner Cloud server (CX22/CX23 class, x86) with a public IP. No private Cloud Network needed — this design deliberately uses public IPs with the Cloud Firewall as the real boundary (a Hetzner private network is explicitly *not* filtered by their Cloud Firewall, so it would have been a false sense of security here).
-
-### 2. Initial access
-
-Use whatever SSH key or root password Hetzner issues at creation to log in exactly once:
-
-```bash
-ssh root@<proxy-public-ip>
-```
-
-### 3. Join the tailnet (for your own management access, not for app traffic)
-
-```bash
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --advertise-tags=tag:proxy-server --ssh
-```
-
-Follow the browser auth link. Afterwards, confirm in the Tailscale admin console that the machine registered with `tag:proxy-server` (not as an untagged personal device). From then on, `tailscale ssh root@<proxy-hostname>` is how you and CI reach this box — never a public SSH port.
-
-The tailnet policy file needs `tag:proxy-server` defined and a grant allowing `tag:ci` to reach it on `tcp:22`:
-
-```jsonc
-{
-  "tagOwners": {
-    "tag:ci":           ["autogroup:admin"],
-    "tag:dev-server":   ["autogroup:admin"],
-    "tag:proxy-server": ["autogroup:admin"],
-  },
-  "grants": [
-    { "src": ["autogroup:member"], "dst": ["*"], "ip": ["*"] },
-    { "src": ["tag:ci"], "dst": ["tag:dev-server"],   "ip": ["tcp:22"] },
-    { "src": ["tag:ci"], "dst": ["tag:proxy-server"], "ip": ["tcp:22"] },
-  ],
-  "ssh": [
-    { "action": "check",  "src": ["autogroup:member"], "dst": ["tag:dev-server"],   "users": ["root"] },
-    { "action": "accept", "src": ["tag:ci"],           "dst": ["tag:dev-server"],   "users": ["root"] },
-    { "action": "check",  "src": ["autogroup:member"], "dst": ["tag:proxy-server"], "users": ["root"] },
-    { "action": "accept", "src": ["tag:ci"],           "dst": ["tag:proxy-server"], "users": ["root"] },
-  ],
-}
-```
-
-### 4. Hetzner Cloud Firewall rules
-
-**On this proxy box:**
-- Inbound: allow only `<dev-server-public-ip>/32` on `tcp:3128`. Deny everything else inbound.
-- Outbound: leave open. Squid's own ACL is what restricts *where* this box relays traffic — restricting this box's own egress by IP would just reintroduce the same "CDN IPs change" problem this whole proxy exists to solve.
-
-**On `parapet-hetzner-dev`** (documented here since the two are a matched pair, even though this rule lives on the other box):
-- Outbound, allow only:
-  - `<this-proxy-public-ip>/32` on `tcp:3128` — carries the app's API calls, `git fetch`, and `docker pull`, all tunneled through here.
-  - `tcp:443` to `0.0.0.0/0` — Tailscale's control plane. This **cannot** be narrowed to just the DERP relay IPs (a separate, smaller set) without risk of breaking Tailscale itself, since the control-plane servers aren't in that list and don't publish a stable range. Tailscale's own guidance is to leave this wide rather than enumerate it.
-  - `udp:41641` to `0.0.0.0/0` — direct WireGuard.
-  - `udp:3478` to `0.0.0.0/0` — STUN, for NAT traversal.
-  - `udp:53` — DNS, needed for Tailscale's own bootstrap resolution.
-- Inbound: deny everything. Access is via Tailscale only.
-
-### 5. Install Squid
-
-```bash
-apt update && apt install -y squid
-```
-
-This starts Squid via systemd with a default config. The **content** of that config (the allowlist) is what this repo manages from here on — don't hand-edit `/etc/squid/squid.conf` on the box after this point; treat this repo as the source of truth (see below).
-
-### 6. Configure this repo
-
-**Secrets** (repo Settings → Secrets and variables → Actions → Secrets):
-- `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET` — the Tailscale OAuth client credentials tagged `tag:ci`. These are the **same credentials** used by the `deploy-dev.yml` workflow in the main `parapet` repo — one OAuth client, scoped by tag, reused across repos. If you ever regenerate them, update both repos.
-
-**Variables** (Settings → Secrets and variables → Actions → Variables):
-- `PROXY_HOST` — this proxy box's Tailscale MagicDNS name (e.g. `parapet-hetzner-proxy.taile7829a.ts.net`). Find it via `tailscale status` on the box, or the Machines page in the admin console.
-- `APP_BOX_PUBLIC_IP` — `parapet-hetzner-dev`'s public IP. Used to render `allowed_src` in the Squid config template.
-
-### 7. First deploy
-
-Push to `main` (or merge the PR that adds this setup). The Action renders `squid.conf.template`, validates it, connects to the tailnet, ships it to this box, and reloads Squid. See "Verifying it's working" below to confirm end to end.
-
+ 
+## What lives where
+ 
+| Concern | Where |
+|---|---|
+| Squid allowlist + deploy pipeline | **this repo** |
+| Gateway provisioning (Tailscale subnet router, nftables, NAT, SSH keys), dev box setup, CI wiring | `parapet` repo → `DEPLOY_DEV.md` |
+| Tailscale ACL policy | Tailscale admin console (copy kept in `DEPLOY_DEV.md`, Phase 3) |
+ 
+The gateway is tagged `tag:gateway` on the tailnet. There is no `tag:proxy-server` and no `tag:dev-server`: the dev box is not on the tailnet at all.
+ 
 ---
-
-## Ongoing usage — changing the allowlist
-
-Edit `squid.conf.template` in a branch, open a PR, get it reviewed, merge to `main`. The Action handles the rest automatically.
-
-**This repo is deliberately excluded from the AI dev pipeline's (`ai-dev-orchestration`) repo access.** That pipeline can open PRs and push code in `ai-dev-orchestration` and `parapet` — never here. The isolation this proxy provides only means something if the thing it's isolating can't also edit the isolation itself. Keep it that way.
-
-Branch protection on `main` (requiring a PR review before merge, even from a single reviewer) is recommended for the same reason — "push to main" should mean "a human looked at this diff," since this repo enforces a security boundary.
-
+ 
+## One-time setup
+ 
+The gateway is provisioned by hand once, following `DEPLOY_DEV.md` Phases 0–6 (private network, `dev_deploy` key, Tailscale subnet router, ACL, nftables, NAT masquerade, Squid install). After that, this repo manages Squid's configuration. Do not hand-edit `/etc/squid/squid.conf` as a permanent fix.
+ 
+### Repo configuration
+ 
+**Secrets** (Settings → Secrets and variables → Actions → Secrets):
+- `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET`: the Tailscale OAuth client for `tag:ci`. These are the **same credentials** used by the workflows in the `parapet` repo. If you regenerate them, update both repos.
+**Variables:**
+- `GATEWAY_TAILNET_HOST`: the gateway's Tailscale MagicDNS name (find it with `tailscale status` on the gateway, or in the admin console).
+- `DEV_SERVER_PRIVATE_IP`: the dev box's private IP (e.g. `10.0.0.4`), rendered into `allowed_src`.
+- `GATEWAY_PRIVATE_IP`: the gateway's private IP (e.g. `10.0.0.2`), rendered into `http_port` and used by the smoke test.
 ---
-
+ 
+## Changing the allowlist
+ 
+Edit `squid.conf.template` on a branch, open a PR, get it reviewed, merge to `main`. The Action does the rest.
+ 
+**This repo is deliberately outside the AI pipeline's repo access.** The pipeline may open PRs and push code in `ai-dev-orchestration` and `parapet`, never here. The containment only means something if the thing being contained can't edit the containment. Protect `main` with required PR review for the same reason: "push to main" should mean "a human looked at this diff".
+ 
+### Domain-matching gotchas
+ 
+`dstdomain` without a leading dot matches **only that exact hostname**; with a leading dot it matches the domain and all subdomains.
+ 
+- `ghcr.io` does not match its blob-storage host (`.githubusercontent.com`). Missing it makes pulls authenticate and then hang.
+- Plain `git fetch` over HTTPS hits bare `github.com`, not only `api.github.com`.
+- Docker Hub pulls need `.docker.io` **and** `.docker.com` (the CDN host `production.cloudfront.docker.com` returned 403 without it).
+- `bleepingcomputer.com` does not match `www.bleepingcomputer.com`; use `.bleepingcomputer.com`.
+When adding an entry, check which host the *actual request* hits (Squid's `access.log` shows `TCP_DENIED` lines) rather than guessing.
+ 
+Current allowlist: `api.github.com`, `github.com`, `.githubusercontent.com`, `ghcr.io`, `api.anthropic.com`, `.bleepingcomputer.com`, `socket.dev`, `.docker.io`, `.docker.com`.
+ 
+---
+ 
 ## How the deploy pipeline works
-
+ 
 ```
 push to main
   → checkout
-  → envsubst renders squid.conf.template → squid.conf (using APP_BOX_PUBLIC_IP)
-  → squid -k parse inside a container, on the runner — catches syntax errors
-    before anything touches the real box
+  → envsubst renders squid.conf.template → squid.conf
+  → squid -k parse on the runner (catches syntax errors early)
   → connect to the tailnet as an ephemeral tag:ci node
-    (via TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET)
-  → ssh to PROXY_HOST:
-      - back up the current /etc/squid/squid.conf to squid.conf.bak
+  → ssh to the gateway (GATEWAY_TAILNET_HOST):
+      - back up current /etc/squid/squid.conf → squid.conf.bak
       - write the new config
-      - squid -k parse again, on the box itself
+      - squid -k parse again on the box
       - systemctl reload squid only if that parse succeeds
-  → smoke test: confirm an allowed domain works and a non-listed one is denied
+  → smoke test, run FROM THE DEV BOX (ssh to it via the gateway):
+      - an allowlisted domain succeeds through the proxy
+      - a non-listed domain is denied
 ```
-
-The double validation (once on the runner, once on the box right before reload) means a bad config fails the deploy without ever taking down the currently-running Squid — reload only happens if the new file parses cleanly.
-
+ 
+Validation happens twice (runner, then box) so a bad config fails the deploy without touching the running Squid.
+ 
+**The smoke test must run from the dev box**, not the gateway: `allowed_src` only permits the dev box's IP, so a curl from the gateway itself is denied (`TCP_DENIED`) for the wrong reason.
+ 
 ---
-
-## Verifying it's working
-
-From `parapet-hetzner-dev`, after any deploy:
-
+ 
+## Verifying
+ 
+From the dev box:
+ 
 ```bash
-# should succeed — an allowlisted domain
-curl -x http://<proxy-ip>:3128 --fail -sv https://api.github.com
-
-# should be denied — anything not on the list
-curl -x http://<proxy-ip>:3128 --fail -sv https://example.com
+# allowed: should succeed
+curl -x http://<gateway-private-ip>:3128 --fail -sv https://api.github.com
+ 
+# not on the list: should be denied (403)
+curl -x http://<gateway-private-ip>:3128 --fail -sv https://example.com
 ```
-
-On this proxy box, to check Squid's own state without starting a conflicting second instance:
-
+ 
+On the gateway:
+ 
 ```bash
-systemctl status squid      # should show active (running)
-squid -k parse              # validates the live config, doesn't touch the running process
-ss -tlnp | grep 3128         # confirms Squid is actually listening
+systemctl status squid
+squid -k parse
+ss -tlnp | grep 3128          # must show the PRIVATE IP, not 0.0.0.0
+tail -f /var/log/squid/access.log
+nft list ruleset               # one-way forward rule + masquerade present
 ```
-
+ 
 ---
-
+ 
 ## Troubleshooting
-
-**`git fetch`/`curl` on the dev box hangs or refuses instantly when using the proxy.**
-Check in this order: (1) is Squid actually running on this box (`systemctl status squid`)? (2) does this box's inbound Cloud Firewall rule have the dev box's *current* public IP, correctly, as source? (3) from the dev box, does a raw TCP connect to `<proxy-ip>:3128` succeed at all (`curl -v telnet://<proxy-ip>:3128`), independent of git/docker? That isolates whether it's a firewall problem or a Squid/config problem.
-
-**`squid` CLI says "FATAL: Squid is already running."**
-Not an error — it means the systemd-managed instance is already up and you tried to start a second one from the command line. Use `systemctl status squid` to check status, and `squid -k parse` (which doesn't try to bind the port) to validate config without conflicting with the running process.
-
-**Domains that should be blocked aren't, or allowed ones are being blocked.**
-Check `squid.conf`'s `allowed_dst` list — remember a leading dot (`.githubusercontent.com`) matches the domain *and all subdomains*, while a bare domain (`ghcr.io`) matches only that exact host. GHCR in particular serves manifests from `ghcr.io` but image layer blobs from a `githubusercontent.com` subdomain — missing the latter causes pulls that authenticate fine and then hang.
-
+ 
+**Proxy requests hang or are refused from the dev box.** In order: (1) is Squid running (`systemctl status squid`)? (2) is it listening on the gateway's private IP on 3128? (3) from the dev box, does a raw TCP connect to `<gateway-private-ip>:3128` work? That separates a network problem from a Squid problem.
+ 
+**A needed domain is blocked.** Read `/var/log/squid/access.log` for the `TCP_DENIED` host, then add it (with a leading dot if subdomains are needed) via a PR.
+ 
+**Runner can't SSH to the gateway.** Check the runner joined the tailnet as `tag:ci` and the ACL still grants `tag:ci` → `tag:gateway` on `tcp:22`.
+ 
+**Dev box unreachable from CI/laptop while the gateway is fine.** Almost always the NAT masquerade rule is missing (Hetzner drops forwarded packets with tailnet source addresses, silently and invisibly to `tcpdump`). Check `nft list ruleset` for the masquerade rule, and that the route `10.0.0.4/32` is approved in the Tailscale admin console.
+ 
+**`squid` CLI says "Squid is already running".** Not an error; the systemd instance is up. Use `systemctl status squid` and `squid -k parse`.
+ 
 ---
-
+ 
 ## Related
-
-- `parapet` repo — the application this proxy protects; its `.env` sets `HTTP_PROXY`/`HTTPS_PROXY` to point at this box, and its `deploy-dev.yml` shares the same Tailscale OAuth client.
-- Linear PAR-97 — the ticket tracking this restriction.
-- Linear PAR-98 — the broader dev-environment runbook this proxy is one piece of.
+ 
+- `parapet` repo: `DEPLOY_DEV.md` (full runbook + disaster recovery), `DEPLOY.md` (prod).
+- Linear PAR-97 (original egress ticket, superseded design) and PAR-98 (runbook ticket, with the design rationale and dead ends).
