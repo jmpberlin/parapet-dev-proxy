@@ -10,7 +10,8 @@ acl allowed_dst dstdomain \
     .bleepingcomputer.com \
     socket.dev \
     .docker.io \
-    .docker.com
+    .docker.com \
+    api.tensorx.ai
 
 acl SSL_ports port 443
 acl CONNECT method CONNECT
